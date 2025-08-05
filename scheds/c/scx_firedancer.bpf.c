@@ -6,6 +6,7 @@
  * they get priority over other tasks.
  */
 #include <scx/common.bpf.h>
+#include "scx_firedancer.h"
 
 char _license[] SEC("license") = "GPL";
 
@@ -21,6 +22,29 @@ struct {
 	__uint(value_size, sizeof(u64));
 	__uint(max_entries, 2);  /* [firedancer, other] */
 } stats SEC(".maps");
+
+
+/*
+ * The map containing tasks that are enqueued in user space from the kernel.
+ *
+ * This map is drained by the user space scheduler.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_QUEUE);
+	__uint(max_entries, 4096);
+	__type(value, struct scx_fd_enqueued_task);
+} enqueued SEC(".maps");
+
+/*
+ * The map containing tasks that are dispatched to the kernel from user space.
+ *
+ * Drained by the kernel in userland_dispatch().
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_QUEUE);
+	__uint(max_entries, 4096);
+	__type(value, s32);
+} dispatched SEC(".maps");
 
 UEI_DEFINE(uei);
 
@@ -116,16 +140,33 @@ s32 BPF_STRUCT_OPS(firedancer_select_cpu, struct task_struct *p, s32 prev_cpu, u
 	return cpu;
 }
 
+static void enqueue_task_in_user_space(struct task_struct *p, u64 enq_flags)
+{
+	struct scx_fd_enqueued_task task = {};
+
+	task.pid = p->pid;
+	task.sum_exec_runtime = p->se.sum_exec_runtime;
+	task.weight = p->scx.weight;
+
+	if (bpf_map_push_elem(&enqueued, &task, 0)) {
+		bpf_printk("failed to enqueue IN USER SPACE, task: %s", p->comm);
+		// failed to enqueue, just put it on global DSQ
+		scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, enq_flags);
+	} else {
+		bpf_printk("enqueued IN USER SPACE, task: %s", p->comm);
+	}
+}
+
 void BPF_STRUCT_OPS(firedancer_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	// scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, enq_flags);
 
 	if (is_firedancer_task(p)) {
+		// TODO: send up to userspace (long term TODO: check if its the scheduler task)
 		bpf_printk("firedancer_enqueue: %s", p->comm);
+		enqueue_task_in_user_space(p, enq_flags);
 		stat_inc(0);  /* count firedancer tasks */
-		scx_bpf_dsq_insert(p, FIREDANCER_DSQ, SCX_SLICE_DFL, enq_flags);
 	} else {
-		// bpf_printk("other_enqueue: %s", p->comm);
 		stat_inc(1);  /* count other tasks */
 		scx_bpf_dsq_insert(p, OTHER_DSQ, SCX_SLICE_DFL, enq_flags);
 	}
@@ -134,7 +175,6 @@ void BPF_STRUCT_OPS(firedancer_enqueue, struct task_struct *p, u64 enq_flags)
 void BPF_STRUCT_OPS(firedancer_dispatch, s32 cpu, struct task_struct *prev)
 {
 	if (cpu < 40 && cpu >= 20) {
-		bpf_printk("cpu: %d, firedancer_dispatch", cpu);
 		/* CPUs 0-3: prioritize firedancer tasks */
 		scx_bpf_dsq_move_to_local(FIREDANCER_DSQ);
 		/* If no firedancer tasks, allow other tasks to run */
