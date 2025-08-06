@@ -164,8 +164,9 @@ void BPF_STRUCT_OPS(firedancer_enqueue, struct task_struct *p, u64 enq_flags)
 	if (is_firedancer_task(p)) {
 		// TODO: send up to userspace (long term TODO: check if its the scheduler task)
 		bpf_printk("firedancer_enqueue: %s", p->comm);
-		enqueue_task_in_user_space(p, enq_flags);
+		// enqueue_task_in_user_space(p, enq_flags);
 		stat_inc(0);  /* count firedancer tasks */
+		scx_bpf_dsq_insert(p, OTHER_DSQ, SCX_SLICE_DFL, enq_flags);
 	} else {
 		stat_inc(1);  /* count other tasks */
 		scx_bpf_dsq_insert(p, OTHER_DSQ, SCX_SLICE_DFL, enq_flags);

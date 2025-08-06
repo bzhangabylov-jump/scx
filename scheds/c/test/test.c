@@ -14,9 +14,10 @@ struct fd_scheduler_shm {
     char message[256];
     struct {
         int pid;
-        int active;
+        int registered;
+        int idle;
         char name[64];
-    } tiles[16];
+    } tiles[50];
 };
 
 int main(int argc, char **argv) {
@@ -53,9 +54,10 @@ int main(int argc, char **argv) {
         my_tile_id = atoi(argv[1]);
     }
 
-    if (my_tile_id < 16) {
+    if (my_tile_id < 50) {
         shm->tiles[my_tile_id].pid = getpid();
-        shm->tiles[my_tile_id].active = 1;
+        shm->tiles[my_tile_id].registered = 1;
+        shm->tiles[my_tile_id].idle = 0;
         snprintf(shm->tiles[my_tile_id].name, 64, "test_tile_%d", my_tile_id);
         printf("Registered as tile %d\n", my_tile_id);
     }
@@ -69,10 +71,10 @@ int main(int argc, char **argv) {
         printf("Counter updated to: %d\n", shm->test_counter);
 
         // Show active tiles
-        printf("Active tiles: ");
-        for (int j = 0; j < 16; j++) {
-            if (shm->tiles[j].active) {
-                printf("[%d:%s] ", j, shm->tiles[j].name);
+        printf("Registered tiles: ");
+        for (int j = 0; j < 50; j++) {
+            if (shm->tiles[j].registered) {
+                printf("[%d:%s pid=%d idle=%d] ", j, shm->tiles[j].name, shm->tiles[j].pid, shm->tiles[j].idle);
             }
         }
         printf("\n");
@@ -81,8 +83,8 @@ int main(int argc, char **argv) {
     }
 
     // Mark ourselves as inactive before exit
-    if (my_tile_id < 16) {
-        shm->tiles[my_tile_id].active = 0;
+    if (my_tile_id < 50) {
+        shm->tiles[my_tile_id].registered = 0;
     }
 
     munmap(shm, sizeof(struct fd_scheduler_shm));

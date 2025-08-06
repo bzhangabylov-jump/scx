@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <string.h>
 #include <errno.h>
+#include <sys/stat.h>
 
 const char help_fmt[] =
 "A simple sched_ext scheduler for firedancer processes.\n"
@@ -35,9 +36,10 @@ struct fd_scheduler_shm {
     char message[256];
     struct {
         int pid;
-        int active;
+		int registered;
+        int idle;
         char name[64];
-    } tiles[16];
+    } tiles[50];
 };
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
@@ -174,12 +176,13 @@ static void sched_main_loop(struct scx_firedancer* skel)
 			printf("Shared Memory State:\n");
 			printf("  Counter: %d\n", g_shm->test_counter);
 			printf("  Message: %s\n", g_shm->message);
-			printf("  Active tiles: ");
-			for (int i = 0; i < 16; i++) {
-				if (g_shm->tiles[i].active) {
-					printf("[%d:%s pid=%d] ", i,
+			printf("  Registered tiles: ");
+			for (int i = 0; i < 50; i++) {
+				if (g_shm->tiles[i].registered) {
+					printf("[%d:%s pid=%d idle=%d] ", i,
 					       g_shm->tiles[i].name,
-					       g_shm->tiles[i].pid);
+					       g_shm->tiles[i].pid,
+					       g_shm->tiles[i].idle);
 				}
 			}
 			printf("\n");
@@ -191,7 +194,9 @@ static void sched_main_loop(struct scx_firedancer* skel)
 }
 
 static int setup_shm(void) {
+	mode_t old_umask = umask(0);
 	int shm_fd = shm_open("/fd_scheduler_shm", O_CREAT | O_EXCL | O_RDWR, 0666);
+	umask(old_umask);
     if (shm_fd >= 0) {
         if (ftruncate(shm_fd, sizeof(struct fd_scheduler_shm)) < 0) {
             printf("Failed to set shm size: %s\n", strerror(errno));
