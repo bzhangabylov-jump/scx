@@ -1,19 +1,18 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-#include <stdio.h>
+
 #include <unistd.h>
 #include <signal.h>
 #include <assert.h>
 #include <libgen.h>
 #include <bpf/bpf.h>
 #include <scx/common.h>
-#include "scx_firedancer.h"
 #include "scx_firedancer.bpf.skel.h"
-#include "sched.h"
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <string.h>
-#include <errno.h>
 #include <sys/stat.h>
+#include <pthread.h>
+#include "scx_firedancer.h"
 
 const char help_fmt[] =
 "A simple sched_ext scheduler for firedancer processes.\n"
@@ -29,6 +28,44 @@ const char help_fmt[] =
 static bool verbose;
 static volatile int exit_req;
 static int enqueued_fd, dispatched_fd;
+
+static struct scx_firedancer *skel;
+
+struct CircularQueue {
+	struct scx_fd_enqueued_task arr[MAX_ENQUEUED_TASKS];
+	int front;
+	int back;
+	int size;
+};
+
+void initialize_queue(struct CircularQueue* q) {
+	q->front = 0;
+	q->back = 0;
+	q->size = 0;
+}
+
+void enqueue(struct CircularQueue* q, struct scx_fd_enqueued_task* item) {
+	q->arr[q->back] = *item;
+	q->back = (q->back + 1) % MAX_ENQUEUED_TASKS;
+	if (q->back == q->front) {
+		q->front = (q->front + 1) % MAX_ENQUEUED_TASKS;
+	} else {
+		q->size += 1;
+	}
+}
+
+struct scx_fd_enqueued_task* dequeue(struct CircularQueue* q) {
+	if (q->size > 0) {
+		struct scx_fd_enqueued_task* ret_val = &(q->arr[q->front]);
+		q->front = (q->front + 1) % MAX_ENQUEUED_TASKS;
+		q->size -= 1;
+		return ret_val;
+	}
+	errno = EINVAL;
+	return NULL;
+}
+
+static struct CircularQueue cq;
 
 struct fd_scheduler_shm {
     int scheduler_pid;
@@ -84,45 +121,43 @@ static void read_stats(struct scx_firedancer *skel, __u64 *stats)
 	}
 }
 
-struct CircularQueue {
-	struct scx_fd_enqueued_task arr[4096];
-	int front;
-	int back;
-	int size;
-};
+static void *run_stats_printer(void *arg)
+{
+    while (!exit_req) {
+        if (skel && !UEI_EXITED(skel, uei)) {
+            __u64 stats[2];
+            read_stats(skel, stats);
 
-void initialize_queue(struct CircularQueue* q) {
-	q->front = 0;
-	q->back = 0;
-	q->size = 0;
+            printf("=== Firedancer Scheduler Stats ===\n");
+            printf("Firedancer tasks: %llu\n", stats[0]);
+            printf("Other tasks: %llu\n", stats[1]);
+
+            if (g_shm) {
+                printf("\n=== Registered Tiles ===\n");
+                for (int i = 0; i < 50; i++) {
+                    if (g_shm->tiles[i].registered) {
+                        printf("[%2d] %-16s pid=%-6d %s\n",
+                               i, g_shm->tiles[i].name,
+                               g_shm->tiles[i].pid,
+                               g_shm->tiles[i].idle ? "IDLE" : "ACTIVE");
+                    }
+                }
+            }
+            fflush(stdout);
+        }
+        sleep(1);
+    }
+    return NULL;
 }
 
-void enqueue(struct CircularQueue* q, struct scx_fd_enqueued_task* item) {
-	q->arr[q->back] = *item;
-	q->back = (q->back + 1) % 4096;
-	if (q->back == q->front) {
-		q->front = (q->front + 1) % 4096;
-	} else {
-		q->size += 1;
-	}
+static int spawn_stats_thread(void)
+{
+	pthread_t stats_thread;
+    return pthread_create(&stats_thread, NULL, run_stats_printer, NULL);
 }
-
-struct scx_fd_enqueued_task* dequeue(struct CircularQueue* q) {
-	if (q->size > 0) {
-		struct scx_fd_enqueued_task* ret_val = &(q->arr[q->front]);
-		q->front = (q->front + 1) % 4096;
-		q->size -= 1;
-		return ret_val;
-	}
-	errno = EINVAL;
-	return NULL;
-}
-
-struct CircularQueue cq;
 
 int user_space_schedule(struct scx_fd_enqueued_task *task)
 {
-	printf("USER SPACE SCHEDULED %d", task->pid);
 	enqueue(&cq, task);
 	return 0;
 }
@@ -136,7 +171,6 @@ static void drain_enqueued_map(void)
 		if (bpf_map_lookup_and_delete_elem(enqueued_fd, NULL, &task)) {
 			return;
 		};
-		printf("grabbed from bpf enqueued map: %d", task.pid);
 		err = user_space_schedule(&task);
 		if (err) {
 			fprintf(stderr, "Failed to schedule task in user space %d: %s\n",
@@ -150,46 +184,27 @@ static void drain_enqueued_map(void)
 
 static void dispatch_batch(void)
 {
-	// for (int i = 0; i < 8; i++) {
-	// 	struct scx_fd_enqueued_task* task = dequeue(&cq);
-	// }
+	for (int i = 0; i < 8; i++) {
+		struct scx_fd_enqueued_task* task = dequeue(&cq);
+		if (task) {
+			int err;
+			err = bpf_map_update_elem(dispatched_fd, NULL, &task->pid, 0);
+			if (err) {
+				printf("failed to update dispatch map %d", task->pid);
+			}
+		}
+	}
 	return;
 }
 
 
-static void sched_main_loop(struct scx_firedancer* skel)
+static void sched_main_loop(void)
 {
 
 	while (!exit_req && !UEI_EXITED(skel, uei)) {
 		drain_enqueued_map();
 		dispatch_batch();
 		// sched_yield();
-
-		__u64 stats[2];
-
-		read_stats(skel, stats);
-		printf("firedancer_tasks=%llu other_tasks=%llu\n",
-		       stats[0], stats[1]);
-
-		// Display shared memory state
-		if (g_shm) {
-			printf("Shared Memory State:\n");
-			printf("  Counter: %d\n", g_shm->test_counter);
-			printf("  Message: %s\n", g_shm->message);
-			printf("  Registered tiles: ");
-			for (int i = 0; i < 50; i++) {
-				if (g_shm->tiles[i].registered) {
-					printf("[%d:%s pid=%d idle=%d] ", i,
-					       g_shm->tiles[i].name,
-					       g_shm->tiles[i].pid,
-					       g_shm->tiles[i].idle);
-				}
-			}
-			printf("\n");
-		}
-
-		fflush(stdout);
-		sleep(1);
 	}
 }
 
@@ -233,13 +248,14 @@ static int setup_shm(void) {
 
 int main(int argc, char **argv)
 {
+	initialize_queue(&cq);
+
 	int shm_ret = setup_shm();
 	if (shm_ret < 0) {
 		cleanup_shm();
 		return shm_ret;
 	}
 
-	struct scx_firedancer *skel;
 	struct bpf_link *link;
 	__u32 opt;
 	__u64 ecode;
@@ -268,11 +284,13 @@ restart:
 	assert(enqueued_fd > 0);
 	assert(dispatched_fd > 0);
 
+	SCX_BUG_ON(spawn_stats_thread(), "Failed to spawn stats thread");
+
 	link = SCX_OPS_ATTACH(skel, firedancer_ops, scx_firedancer);
 
 	printf("Firedancer scheduler running.\n");
 
-	sched_main_loop(skel);
+	sched_main_loop();
 
 	exit_req = 1;
 	bpf_link__destroy(link);

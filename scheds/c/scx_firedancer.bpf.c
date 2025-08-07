@@ -31,7 +31,7 @@ struct {
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_QUEUE);
-	__uint(max_entries, 4096);
+	__uint(max_entries, MAX_ENQUEUED_TASKS);
 	__type(value, struct scx_fd_enqueued_task);
 } enqueued SEC(".maps");
 
@@ -42,7 +42,7 @@ struct {
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_QUEUE);
-	__uint(max_entries, 4096);
+	__uint(max_entries, MAX_ENQUEUED_TASKS);
 	__type(value, s32);
 } dispatched SEC(".maps");
 
@@ -58,6 +58,7 @@ static void stat_inc(u32 idx)
 /* Helper function to check if a task is a Firedancer task */
 static bool is_firedancer_task(struct task_struct *p)
 {
+	// TODO: classify based on user
 	/* Benchmark tiles */
 	if (bpf_strncmp(p->comm, 7, "benchg:") == 0) return true;
 	if (bpf_strncmp(p->comm, 7, "benchs:") == 0) return true;
@@ -97,45 +98,13 @@ static bool is_firedancer_task(struct task_struct *p)
 
 s32 BPF_STRUCT_OPS(firedancer_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
-	// if (is_firedancer_task(p)) {
-	// 	/* Prefer CPUs 0-3 for Firedancer tasks */
-	// 	// bool is_idle = false;
-	// 	s32 cpu;
-
-	// 	/* First try to find an idle CPU among 0-3 */
-	// 	for (cpu = 0; cpu < 4; cpu++) {
-	// 		if (scx_bpf_test_and_clear_cpu_idle(cpu))
-	// 			return cpu;
-	// 	}
-
-	// 	/* If no idle CPU found, prefer CPU 0 */
-	// 	return 0;
-	// }
-
-	// /* For non-Firedancer tasks, use default selection but avoid CPUs 0-3 if possible */
-	// bool is_idle = false;
-	// s32 cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
-
-	// /* If selected CPU is in firedancer range and we have other options, try another */
-	// if (cpu < 4 && !is_idle) {
-	// 	/* Try to find an idle CPU outside the firedancer range */
-	// 	s32 nr_cpus = scx_bpf_nr_cpu_ids();
-	// 	for (s32 i = 4; i < nr_cpus; i++) {
-	// 		if (scx_bpf_test_and_clear_cpu_idle(i))
-	// 			return i;
-	// 	}
-	// }
-
-	// return cpu;
 	s32 cpu;
-	/* Need to initialize or the BPF verifier will reject the program */
 	bool direct = false;
 
 	cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &direct);
 
-	// cut out select_cpu logic for now
-	// if (direct)
-	// 	scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+	if (direct)
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
 
 	return cpu;
 }
@@ -150,46 +119,45 @@ static void enqueue_task_in_user_space(struct task_struct *p, u64 enq_flags)
 
 	if (bpf_map_push_elem(&enqueued, &task, 0)) {
 		bpf_printk("failed to enqueue IN USER SPACE, task: %s", p->comm);
-		// failed to enqueue, just put it on global DSQ
-		scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, enq_flags);
-	} else {
-		bpf_printk("enqueued IN USER SPACE, task: %s", p->comm);
+		scx_bpf_dsq_insert(p, OTHER_DSQ, SCX_SLICE_DFL, enq_flags);
 	}
 }
 
 void BPF_STRUCT_OPS(firedancer_enqueue, struct task_struct *p, u64 enq_flags)
 {
-	// scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, enq_flags);
-
 	if (is_firedancer_task(p)) {
 		// TODO: send up to userspace (long term TODO: check if its the scheduler task)
-		bpf_printk("firedancer_enqueue: %s", p->comm);
-		// enqueue_task_in_user_space(p, enq_flags);
+		enqueue_task_in_user_space(p, enq_flags);
 		stat_inc(0);  /* count firedancer tasks */
-		scx_bpf_dsq_insert(p, OTHER_DSQ, SCX_SLICE_DFL, enq_flags);
 	} else {
-		stat_inc(1);  /* count other tasks */
 		scx_bpf_dsq_insert(p, OTHER_DSQ, SCX_SLICE_DFL, enq_flags);
+		stat_inc(1);  /* count other tasks */
 	}
 }
 
 void BPF_STRUCT_OPS(firedancer_dispatch, s32 cpu, struct task_struct *prev)
 {
-	if (cpu < 40 && cpu >= 20) {
-		/* CPUs 0-3: prioritize firedancer tasks */
-		scx_bpf_dsq_move_to_local(FIREDANCER_DSQ);
-		/* If no firedancer tasks, allow other tasks to run */
-		scx_bpf_dsq_move_to_local(OTHER_DSQ);
-	} else {
-		/* Other CPUs: prioritize non-firedancer tasks */
-		scx_bpf_dsq_move_to_local(OTHER_DSQ);
-		/* But also check if there are firedancer tasks that need to run */
+	bpf_repeat(MAX_ENQUEUED_TASKS) {
+		s32 pid;
+		struct task_struct *p;
+		if (bpf_map_pop_elem(&dispatched, &pid))
+			break;
+		p = bpf_task_from_pid(pid);
+		if (!p) /* task exited by time we got around to dispatching it which is normal */
+			continue;
+		scx_bpf_dsq_insert(p, FIREDANCER_DSQ, SCX_SLICE_DFL, 0);
+		bpf_task_release(p);
 	}
+
+	if (scx_bpf_dsq_move_to_local(FIREDANCER_DSQ))
+		return;
+
+	if (scx_bpf_dsq_move_to_local(OTHER_DSQ))
+		return;
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(firedancer_init)
 {
-	// return 0;
 	s32 ret;
 
 	/* Create custom DSQs */
