@@ -74,9 +74,16 @@ struct fd_scheduler_shm {
         int pid;
 		int registered;
         int idle;
+		long deadline_ts;
         char name[64];
     } tiles[50];
 };
+
+static u64 get_time_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (u64)ts.tv_sec * 1000000000ULL + (u64)ts.tv_nsec;
+}
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
 {
@@ -135,14 +142,16 @@ static void *run_stats_printer(void *arg)
 			printf("Scheduler Descheduled Count: %llu\n", stats[4]);
 			printf("queue size: %d\n", cq.size);
 
+			long time_right_now = get_time_ns();
             if (g_shm) {
                 printf("\n=== Registered Tiles ===\n");
                 for (int i = 0; i < 50; i++) {
                     if (g_shm->tiles[i].registered) {
-                        printf("[%2d] %-16s pid=%-6d %s\n",
+                        printf("[%2d] %-16s pid=%-6d %s deadline in %ld us\n",
                                i, g_shm->tiles[i].name,
                                g_shm->tiles[i].pid,
-                               g_shm->tiles[i].idle ? "IDLE" : "ACTIVE");
+                               g_shm->tiles[i].idle ? "IDLE" : "ACTIVE",
+							   g_shm->tiles[i].idle ? (g_shm->tiles[i].deadline_ts - time_right_now) / 1000 : 0);
                     }
                 }
             }
@@ -200,25 +209,18 @@ static void dispatch_batch(void)
 	return;
 }
 
-static u64 get_time_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (u64)ts.tv_sec * 1000000000ULL + (u64)ts.tv_nsec;
-}
-
 static void sched_main_loop(void)
 {
 	u64 last_loop = 0;
     while (!exit_req && !UEI_EXITED(skel, uei)) {
         u64 now = get_time_ns();
-        if (last_loop && (now - last_loop) > 100000) { // 100 microseconds
-            printf("WARNING: Loop blocked for %lu microseconds!\n", (now - last_loop) / 1000);
+        if (last_loop && (now - last_loop) > 1000000) { // 1 millisecond
+            printf("WARNING: Loop blocked for %lu milliseconds!\n", (now - last_loop) / 1000000);
         }
         last_loop = now;
 
         drain_enqueued_map();
         dispatch_batch();
-		sched_yield();
     }
 }
 
@@ -262,6 +264,12 @@ static int setup_shm(void) {
 
 int main(int argc, char **argv)
 {
+	struct sched_param param = {
+		.sched_priority = sched_get_priority_max(SCHED_FIFO) - 1
+	};
+	if (sched_setscheduler(0, SCHED_FIFO, &param) < 0) {
+		perror("Failed to set real-time priority");
+	}
 	initialize_queue(&cq);
 
 	int shm_ret = setup_shm();
@@ -297,18 +305,6 @@ restart:
 	dispatched_fd = bpf_map__fd(skel->maps.dispatched);
 	assert(enqueued_fd > 0);
 	assert(dispatched_fd > 0);
-
-	/* Set the scheduler PID in the BPF map */
-	int scheduler_pid_fd = bpf_map__fd(skel->maps.scheduler_pid);
-	if (scheduler_pid_fd > 0) {
-		__u32 key = 0;
-		pid_t my_pid = getpid();
-		if (bpf_map_update_elem(scheduler_pid_fd, &key, &my_pid, BPF_ANY) == 0) {
-			printf("Set scheduler PID to %d\n", my_pid);
-		} else {
-			fprintf(stderr, "Failed to set scheduler PID: %s\n", strerror(errno));
-		}
-	}
 
 	SCX_BUG_ON(spawn_stats_thread(), "Failed to spawn stats thread");
 
