@@ -17,8 +17,7 @@
 const char help_fmt[] =
 "A simple sched_ext scheduler for firedancer processes.\n"
 "\n"
-"This scheduler reserves CPUs 0-3 for firedancer processes and ensures\n"
-"they get priority scheduling on those cores.\n"
+"WIP"
 "\n"
 "Usage: %s [-v] [-h]\n"
 "\n"
@@ -104,12 +103,12 @@ static void read_stats(struct scx_firedancer *skel, __u64 *stats)
 {
 	int nr_cpus = libbpf_num_possible_cpus();
 	assert(nr_cpus > 0);
-	__u64 cnts[2][nr_cpus];
+	__u64 cnts[5][nr_cpus];
 	__u32 idx;
 
-	memset(stats, 0, sizeof(stats[0]) * 2);
+	memset(stats, 0, sizeof(stats[0]) * 5);
 
-	for (idx = 0; idx < 2; idx++) {
+	for (idx = 0; idx < 5; idx++) {
 		int ret, cpu;
 
 		ret = bpf_map_lookup_elem(bpf_map__fd(skel->maps.stats),
@@ -125,12 +124,16 @@ static void *run_stats_printer(void *arg)
 {
     while (!exit_req) {
         if (skel && !UEI_EXITED(skel, uei)) {
-            __u64 stats[2];
+            __u64 stats[5];
             read_stats(skel, stats);
 
-            printf("=== Firedancer Scheduler Stats ===\n");
+            printf("=== Firedancer Scheduler Stats 1.2 ===\n");
             printf("Firedancer tasks: %llu\n", stats[0]);
             printf("Other tasks: %llu\n", stats[1]);
+			printf("Select cpu firedancer: %llu\n", stats[2]);
+			printf("Select cpu other: %llu\n", stats[3]);
+			printf("Scheduler Descheduled Count: %llu\n", stats[4]);
+			printf("queue size: %d\n", cq.size);
 
             if (g_shm) {
                 printf("\n=== Registered Tiles ===\n");
@@ -184,7 +187,7 @@ static void drain_enqueued_map(void)
 
 static void dispatch_batch(void)
 {
-	for (int i = 0; i < 8; i++) {
+	for (int i = 0; i < cq.size; i++) {
 		struct scx_fd_enqueued_task* task = dequeue(&cq);
 		if (task) {
 			int err;
@@ -197,15 +200,26 @@ static void dispatch_batch(void)
 	return;
 }
 
+static u64 get_time_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (u64)ts.tv_sec * 1000000000ULL + (u64)ts.tv_nsec;
+}
 
 static void sched_main_loop(void)
 {
+	u64 last_loop = 0;
+    while (!exit_req && !UEI_EXITED(skel, uei)) {
+        u64 now = get_time_ns();
+        if (last_loop && (now - last_loop) > 100000) { // 100 microseconds
+            printf("WARNING: Loop blocked for %lu microseconds!\n", (now - last_loop) / 1000);
+        }
+        last_loop = now;
 
-	while (!exit_req && !UEI_EXITED(skel, uei)) {
-		drain_enqueued_map();
-		dispatch_batch();
-		// sched_yield();
-	}
+        drain_enqueued_map();
+        dispatch_batch();
+		sched_yield();
+    }
 }
 
 static int setup_shm(void) {
@@ -283,6 +297,18 @@ restart:
 	dispatched_fd = bpf_map__fd(skel->maps.dispatched);
 	assert(enqueued_fd > 0);
 	assert(dispatched_fd > 0);
+
+	/* Set the scheduler PID in the BPF map */
+	int scheduler_pid_fd = bpf_map__fd(skel->maps.scheduler_pid);
+	if (scheduler_pid_fd > 0) {
+		__u32 key = 0;
+		pid_t my_pid = getpid();
+		if (bpf_map_update_elem(scheduler_pid_fd, &key, &my_pid, BPF_ANY) == 0) {
+			printf("Set scheduler PID to %d\n", my_pid);
+		} else {
+			fprintf(stderr, "Failed to set scheduler PID: %s\n", strerror(errno));
+		}
+	}
 
 	SCX_BUG_ON(spawn_stats_thread(), "Failed to spawn stats thread");
 

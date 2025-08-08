@@ -20,8 +20,16 @@ struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(key_size, sizeof(u32));
 	__uint(value_size, sizeof(u64));
-	__uint(max_entries, 2);  /* [firedancer, other] */
+	__uint(max_entries, 5);  /* [firedancer, other, select_cpu_firedancer, select_cpu_other, scheduler_descheduled] */
 } stats SEC(".maps");
+
+/* Map to store the scheduler process PID */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(key_size, sizeof(u32));
+	__uint(value_size, sizeof(s32));
+	__uint(max_entries, 1);
+} scheduler_pid SEC(".maps");
 
 
 /*
@@ -100,11 +108,27 @@ s32 BPF_STRUCT_OPS(firedancer_select_cpu, struct task_struct *p, s32 prev_cpu, u
 {
 	s32 cpu;
 	bool direct = false;
+	u32 key = 0;
+	s32 *sched_pid = bpf_map_lookup_elem(&scheduler_pid, &key);
 
 	cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &direct);
 
-	if (direct)
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+	/* Check if this is the scheduler process */
+	if (sched_pid && *sched_pid == p->pid) {
+		bpf_printk("Scheduler process (pid=%d) in select_cpu, direct=%d", p->pid, direct);
+		/* Force direct dispatch for scheduler */
+		direct = true;
+	}
+
+	if (direct) {
+		if (is_firedancer_task(p)) {
+			stat_inc(2);
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+		} else {
+			stat_inc(3);
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+		}
+	}
 
 	return cpu;
 }
@@ -125,8 +149,18 @@ static void enqueue_task_in_user_space(struct task_struct *p, u64 enq_flags)
 
 void BPF_STRUCT_OPS(firedancer_enqueue, struct task_struct *p, u64 enq_flags)
 {
+	/* Check if this is the scheduler process itself */
+	u32 key = 0;
+	s32 *sched_pid = bpf_map_lookup_elem(&scheduler_pid, &key);
+	if (sched_pid && *sched_pid == p->pid) {
+		bpf_printk("WARNING: Scheduler process (pid=%d) is being enqueued!", p->pid);
+		stat_inc(4);
+		/* Always put scheduler on global DSQ with highest priority, infinite time slice + yielding to batch tasks */
+		scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_INF, 0);
+		return;
+	}
+
 	if (is_firedancer_task(p)) {
-		// TODO: send up to userspace (long term TODO: check if its the scheduler task)
 		enqueue_task_in_user_space(p, enq_flags);
 		stat_inc(0);  /* count firedancer tasks */
 	} else {
