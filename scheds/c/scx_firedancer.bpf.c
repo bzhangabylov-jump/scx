@@ -20,8 +20,20 @@ struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(key_size, sizeof(u32));
 	__uint(value_size, sizeof(u64));
-	__uint(max_entries, 5);  /* [firedancer, other, select_cpu_firedancer, select_cpu_other, scheduler_descheduled] */
+	__uint(max_entries, 5);  /* [firedancer enqueued in US, other, select_cpu_firedancer, select_cpu_other, enqueued in kernel] */
 } stats SEC(".maps");
+
+/*
+ * Map to track idle status of firedancer processes
+ * Key: PID
+ * Value: 1 if idle, 0 if active
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(key_size, sizeof(s32));
+	__uint(value_size, sizeof(u8));
+	__uint(max_entries, 1024);  /* Maximum number of firedancer processes to track */
+} fd_idle_status SEC(".maps");
 
 /*
  * The map containing tasks that are enqueued in user space from the kernel.
@@ -62,7 +74,7 @@ static bool is_firedancer_task(struct task_struct *p)
 	if (bpf_strncmp(p->comm, 7, "benchg:") == 0) return true;
 	if (bpf_strncmp(p->comm, 7, "benchs:") == 0) return true;
 	if (bpf_strncmp(p->comm, 7, "bencho:") == 0) return true;
-	if (bpf_strncmp(p->comm, 5, "bank:") == 0) return true;
+	// if (bpf_strncmp(p->comm, 5, "bank:") == 0) return true;
 
 	/* Core processing tiles */
 	if (bpf_strncmp(p->comm, 4, "poh:") == 0) return true;
@@ -77,20 +89,20 @@ static bool is_firedancer_task(struct task_struct *p)
 
 	/* Data processing tiles */
 	if (bpf_strncmp(p->comm, 6, "dedup:") == 0) return true;
-	if (bpf_strncmp(p->comm, 7, "netlnk:") == 0) return true;
+	// if (bpf_strncmp(p->comm, 7, "netlnk:") == 0) return true;
 	if (bpf_strncmp(p->comm, 7, "resolv:") == 0) return true;
 	if (bpf_strncmp(p->comm, 6, "shred:") == 0) return true;
 	if (bpf_strncmp(p->comm, 5, "sign:") == 0) return true;
 	if (bpf_strncmp(p->comm, 6, "store:") == 0) return true;
 
 	/* Service tiles */
-	if (bpf_strncmp(p->comm, 7, "metric:") == 0) return true;
+	// if (bpf_strncmp(p->comm, 7, "metric:") == 0) return true;
 	if (bpf_strncmp(p->comm, 7, "plugin:") == 0) return true;
 	if (bpf_strncmp(p->comm, 4, "gui:") == 0) return true;
 
 	/* Other tiles */
 	if (bpf_strncmp(p->comm, 7, "bundle:") == 0) return true;
-	if (bpf_strncmp(p->comm, 7, "cswtch:") == 0) return true;
+	// if (bpf_strncmp(p->comm, 7, "cswtch:") == 0) return true;
 
 	return false;
 }
@@ -131,8 +143,20 @@ static void enqueue_task_in_user_space(struct task_struct *p, u64 enq_flags)
 void BPF_STRUCT_OPS(firedancer_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	if (is_firedancer_task(p)) {
-		enqueue_task_in_user_space(p, enq_flags);
-		stat_inc(0);  /* count firedancer tasks */
+		s32 pid = p->pid;
+		u8 *idle_status = bpf_map_lookup_elem(&fd_idle_status, &pid);
+
+		/*
+		* If task is idle, don't shortcut - let userspace scheduler handle it.
+		*/
+		if (idle_status && *idle_status == 1) {
+			enqueue_task_in_user_space(p, enq_flags);
+			stat_inc(0);  /* count firedancer tasks */
+		} else {
+			/* Task is active or not tracked, proceed with direct dispatch */
+			stat_inc(4); /* firedancer enqueued in kernel */
+			scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, 0);
+		}
 	} else {
 		scx_bpf_dsq_insert(p, OTHER_DSQ, SCX_SLICE_DFL, enq_flags);
 		stat_inc(1);  /* count other tasks */

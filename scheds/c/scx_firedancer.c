@@ -27,8 +27,17 @@ const char help_fmt[] =
 static bool verbose;
 static volatile int exit_req;
 static int enqueued_fd, dispatched_fd;
+static int fd_idle_status_fd;
 
 static struct scx_firedancer *skel;
+
+/* Cache for tracking idle status to avoid unnecessary BPF map updates */
+struct idle_cache_entry {
+	int pid;
+	u8 idle_status;
+	int valid;
+};
+static struct idle_cache_entry idle_cache[50];
 
 struct CircularQueue {
 	struct scx_fd_enqueued_task arr[MAX_ENQUEUED_TASKS];
@@ -62,6 +71,40 @@ struct scx_fd_enqueued_task* dequeue(struct CircularQueue* q) {
 	}
 	errno = EINVAL;
 	return NULL;
+}
+
+static void cleanup_idle_entry(s32 pid)
+{
+	if (fd_idle_status_fd > 0) {
+		bpf_map_delete_elem(fd_idle_status_fd, &pid);
+	}
+}
+
+static void dump_idle_status_map(void)
+{
+    if (fd_idle_status_fd <= 0) {
+        printf("fd_idle_status map not available\n");
+        return;
+    }
+
+    printf("\n=== DUMP: Complete fd_idle_status BPF Map ===\n");
+
+    s32 key = -1, next_key;
+    u8 value;
+    int count = 0;
+
+    /* Iterate through all entries in the map */
+    while (bpf_map_get_next_key(fd_idle_status_fd, &key, &next_key) == 0) {
+        if (bpf_map_lookup_elem(fd_idle_status_fd, &next_key, &value) == 0) {
+            printf("  PID %d -> %s (value=%d)\n",
+                   next_key, value ? "IDLE" : "ACTIVE", value);
+            count++;
+        }
+        key = next_key;
+    }
+
+    printf("Total entries in map: %d\n", count);
+    printf("=== END DUMP ===\n\n");
 }
 
 static struct CircularQueue cq;
@@ -135,11 +178,11 @@ static void *run_stats_printer(void *arg)
             read_stats(skel, stats);
 
             printf("=== Firedancer Scheduler Stats 1.2 ===\n");
-            printf("Firedancer tasks: %llu\n", stats[0]);
-            printf("Other tasks: %llu\n", stats[1]);
-			printf("Select cpu firedancer: %llu\n", stats[2]);
-			printf("Select cpu other: %llu\n", stats[3]);
-			printf("Scheduler Descheduled Count: %llu\n", stats[4]);
+            printf("Firedancer tasks enqueued in US: %llu\n", stats[0]);
+			printf("Firedancer enqueued in Kernel: %llu\n", stats[4]);
+			printf("Firedancer tasks dispatched in select_cpu: %llu\n", stats[2]);
+            printf("Other tasks enqueued in kernel: %llu\n", stats[1]);
+			printf("Other tasks dispatched in select_cpu: %llu\n", stats[3]);
 			printf("queue size: %d\n", cq.size);
 
 			long time_right_now = get_time_ns();
@@ -155,6 +198,7 @@ static void *run_stats_printer(void *arg)
                     }
                 }
             }
+			dump_idle_status_map();
             fflush(stdout);
         }
         sleep(1);
@@ -171,12 +215,17 @@ static int spawn_stats_thread(void)
 int user_space_schedule(struct scx_fd_enqueued_task *task)
 {
 	enqueue(&cq, task);
+
+	for (int i = 0; i < 50; i++) {
+		if (g_shm->tiles[i].registered && g_shm->tiles[i].pid == task->pid) {
+			assert( g_shm->tiles[i].idle == 1 );
+		}
+	}
 	return 0;
 }
 
 static void drain_enqueued_map(void)
 {
-
 	while (1) {
 		struct scx_fd_enqueued_task task;
 		int err;
@@ -190,7 +239,6 @@ static void drain_enqueued_map(void)
 			exit_req = 1;
 			return;
 		}
-
 	}
 }
 
@@ -209,9 +257,46 @@ static void dispatch_batch(void)
 	return;
 }
 
+static void update_idle_status_from_shm(void)
+{
+	if (!g_shm || fd_idle_status_fd <= 0)
+		return;
+
+	/* Update BPF map only when idle status changes */
+	for (int i = 0; i < 50; i++) {
+		if (g_shm->tiles[i].registered) {
+			s32 pid = g_shm->tiles[i].pid;
+			u8 idle_status = g_shm->tiles[i].idle ? 1 : 0;
+
+			/* Check if we need to update - either new entry or status changed */
+			if (!idle_cache[i].valid ||
+			    idle_cache[i].pid != pid ||
+			    idle_cache[i].idle_status != idle_status) {
+
+				if (bpf_map_update_elem(fd_idle_status_fd, &pid, &idle_status, BPF_ANY) == 0) {
+					idle_cache[i].pid = pid;
+					idle_cache[i].idle_status = idle_status;
+					idle_cache[i].valid = 1;
+				} else {
+					printf("Failed to update idle status for PID %d: %s\n", pid, strerror(errno));
+					exit(1);
+				}
+			}
+		} else if (idle_cache[i].valid) {
+			/* Tile was unregistered, clean up */
+			printf("Tile was unregistered, cleaning up, pid: %d\n", idle_cache[i].pid);
+			exit(1);
+			cleanup_idle_entry(idle_cache[i].pid);
+			idle_cache[i].valid = 0;
+		}
+	}
+}
+
 static void sched_main_loop(void)
 {
 	u64 last_loop = 0;
+	int idle_update_counter = 0;
+
     while (!exit_req && !UEI_EXITED(skel, uei)) {
         u64 now = get_time_ns();
         if (last_loop && (now - last_loop) > 1000000) { // 1 millisecond
@@ -221,6 +306,12 @@ static void sched_main_loop(void)
 
         drain_enqueued_map();
         dispatch_batch();
+
+        /* Update idle status frequently - every 1000 iterations */
+        if (++idle_update_counter >= 1000) {
+            idle_update_counter = 0;
+            update_idle_status_from_shm();
+        }
     }
 }
 
@@ -303,8 +394,10 @@ restart:
 
 	enqueued_fd = bpf_map__fd(skel->maps.enqueued);
 	dispatched_fd = bpf_map__fd(skel->maps.dispatched);
+	fd_idle_status_fd = bpf_map__fd(skel->maps.fd_idle_status);
 	assert(enqueued_fd > 0);
 	assert(dispatched_fd > 0);
+	assert(fd_idle_status_fd > 0);
 
 	SCX_BUG_ON(spawn_stats_thread(), "Failed to spawn stats thread");
 
