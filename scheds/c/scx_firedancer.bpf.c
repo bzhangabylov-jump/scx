@@ -131,7 +131,6 @@ static void enqueue_task_in_user_space(struct task_struct *p, u64 enq_flags)
 	struct scx_fd_enqueued_task task = {};
 
 	task.pid = p->pid;
-	task.sum_exec_runtime = p->se.sum_exec_runtime;
 	task.weight = p->scx.weight;
 
 	if (bpf_map_push_elem(&enqueued, &task, 0)) {

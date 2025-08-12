@@ -137,6 +137,18 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va
 
 static struct fd_scheduler_shm *g_shm = NULL;
 
+static long get_deadline_ts_for_pid(int pid) {
+    if (!g_shm) {
+        return -1; /* unknown */
+    }
+    for (int i = 0; i < 50; i++) {
+        if (g_shm->tiles[i].registered && g_shm->tiles[i].pid == pid) {
+            return g_shm->tiles[i].deadline_ts;
+        }
+    }
+    return -1; /* not found */
+}
+
 static void cleanup_shm(void) {
     if (g_shm) {
         munmap(g_shm, sizeof(struct fd_scheduler_shm));
@@ -147,6 +159,20 @@ static void cleanup_shm(void) {
 static void sigint_handler(int simple)
 {
 	exit_req = 1;
+}
+
+
+static void print_queue_state() {
+	printf("================ QUEUE STATE ==============\n");
+	int cur = cq.front;
+	long time_right_now = (long) get_time_ns();
+	printf("TIME RIGHT NOW IS %ld\n", time_right_now);
+	for (int i = 0; i < cq.size; i++) {
+		int pid = cq.arr[cur].pid;
+		long deadline_ts = get_deadline_ts_for_pid(pid);
+		printf("pid: %d, deadline_ts: %ld, until deadline: %ld \n", pid, deadline_ts, deadline_ts - time_right_now);
+		cur = (cur + 1) % MAX_ENQUEUED_TASKS;
+	}
 }
 
 static void read_stats(struct scx_firedancer *skel, __u64 *stats)
@@ -199,6 +225,7 @@ static void *run_stats_printer(void *arg)
                 }
             }
 			dump_idle_status_map();
+			print_queue_state();
             fflush(stdout);
         }
         sleep(1);
@@ -214,13 +241,8 @@ static int spawn_stats_thread(void)
 
 int user_space_schedule(struct scx_fd_enqueued_task *task)
 {
+	task->deadline_ts = get_deadline_ts_for_pid(task->pid);
 	enqueue(&cq, task);
-
-	for (int i = 0; i < 50; i++) {
-		if (g_shm->tiles[i].registered && g_shm->tiles[i].pid == task->pid) {
-			assert( g_shm->tiles[i].idle == 1 );
-		}
-	}
 	return 0;
 }
 
@@ -244,14 +266,19 @@ static void drain_enqueued_map(void)
 
 static void dispatch_batch(void)
 {
+	ulong time = get_time_ns();
 	for (int i = 0; i < cq.size; i++) {
 		struct scx_fd_enqueued_task* task = dequeue(&cq);
-		if (task) {
-			int err;
-			err = bpf_map_update_elem(dispatched_fd, NULL, &task->pid, 0);
+		if (!task) continue;
+
+		if ((long) time >= task->deadline_ts) {
+			int err = bpf_map_update_elem(dispatched_fd, NULL, &task->pid, 0);
 			if (err) {
 				printf("failed to update dispatch map %d", task->pid);
 			}
+		} else {
+			/* Not ready yet; push back for a future round */
+			enqueue(&cq, task);
 		}
 	}
 	return;

@@ -11,7 +11,7 @@
  */
 struct scx_fd_enqueued_task {
 	__s32 pid;
-	u64 sum_exec_runtime;
+	int64_t deadline_ts;
 	u64 weight;
 };
 
