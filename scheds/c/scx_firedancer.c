@@ -6,6 +6,7 @@
 #include <libgen.h>
 #include <bpf/bpf.h>
 #include <scx/common.h>
+#include "bpf/libbpf.h"
 #include "scx_firedancer.bpf.skel.h"
 #include <sys/mman.h>
 #include <fcntl.h>
@@ -28,6 +29,7 @@ static bool verbose;
 static volatile int exit_req;
 static int enqueued_fd, dispatched_fd;
 static int fd_idle_status_fd;
+static int system_idle_pct_fd;
 
 static struct scx_firedancer *skel;
 
@@ -162,6 +164,46 @@ static void sigint_handler(int simple)
 }
 
 
+
+/* Calculate idle percentage from shared memory */
+static u32 calculate_idle_percentage(void)
+{
+    if (!g_shm)
+        return 0;
+
+    u32 idle_count = 0;
+    u32 total_count = 0;
+
+    for (int i = 0; i < 50; i++) {
+        if (g_shm->tiles[i].registered) {
+            total_count++;
+            if (g_shm->tiles[i].idle)
+                idle_count++;
+        }
+    }
+
+	total_count -= 3; // taking off for cswtch, netlnk, and metric
+    if (total_count == 0)
+        return 0;
+
+    return (idle_count * 100) / total_count;
+}
+
+/* Update the idle percentage in BPF map */
+static void update_system_idle_percentage(void)
+{
+    if (system_idle_pct_fd <= 0)
+        return;
+
+    u32 key = 0;
+    u32 idle_pct = calculate_idle_percentage();
+
+    if (bpf_map_update_elem(system_idle_pct_fd, &key, &idle_pct, BPF_ANY) < 0) {
+        fprintf(stderr, "Failed to update idle percentage: %s\n", strerror(errno));
+		exit(1);
+    }
+}
+
 static void print_queue_state() {
 	printf("================ QUEUE STATE ==============\n");
 	int cur = cq.front;
@@ -202,7 +244,6 @@ static void *run_stats_printer(void *arg)
         if (skel && !UEI_EXITED(skel, uei)) {
             __u64 stats[5];
             read_stats(skel, stats);
-
             printf("=== Firedancer Scheduler Stats 1.2 ===\n");
             printf("Firedancer tasks enqueued in US: %llu\n", stats[0]);
 			printf("Firedancer enqueued in Kernel: %llu\n", stats[4]);
@@ -210,6 +251,7 @@ static void *run_stats_printer(void *arg)
             printf("Other tasks enqueued in kernel: %llu\n", stats[1]);
 			printf("Other tasks dispatched in select_cpu: %llu\n", stats[3]);
 			printf("queue size: %d\n", cq.size);
+			printf("System idle percentage: %d%%\n", calculate_idle_percentage());
 
 			long time_right_now = get_time_ns();
             if (g_shm) {
@@ -224,8 +266,8 @@ static void *run_stats_printer(void *arg)
                     }
                 }
             }
-			dump_idle_status_map();
-			print_queue_state();
+			// dump_idle_status_map();
+			// print_queue_state();
             fflush(stdout);
         }
         sleep(1);
@@ -338,6 +380,7 @@ static void sched_main_loop(void)
         if (++idle_update_counter >= 1000) {
             idle_update_counter = 0;
             update_idle_status_from_shm();
+			update_system_idle_percentage();
         }
     }
 }
@@ -417,15 +460,17 @@ restart:
 		}
 	}
 
+	skel->rodata->num_possible_cpus = libbpf_num_possible_cpus();
 	SCX_OPS_LOAD(skel, firedancer_ops, scx_firedancer, uei);
 
 	enqueued_fd = bpf_map__fd(skel->maps.enqueued);
 	dispatched_fd = bpf_map__fd(skel->maps.dispatched);
 	fd_idle_status_fd = bpf_map__fd(skel->maps.fd_idle_status);
+	system_idle_pct_fd = bpf_map__fd(skel->maps.system_idle_pct);
 	assert(enqueued_fd > 0);
 	assert(dispatched_fd > 0);
 	assert(fd_idle_status_fd > 0);
-
+	assert(system_idle_pct_fd > 0);
 	SCX_BUG_ON(spawn_stats_thread(), "Failed to spawn stats thread");
 
 	link = SCX_OPS_ATTACH(skel, firedancer_ops, scx_firedancer);

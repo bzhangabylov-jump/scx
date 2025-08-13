@@ -59,6 +59,40 @@ struct {
 
 UEI_DEFINE(uei);
 
+/* !0 for veristat, set during init */
+const volatile u32 num_possible_cpus = 64;
+
+const volatile u32 fd_cpu_start = 20;
+const volatile u32 fd_cpu_end = 50;
+
+const volatile u32 fd_cpu_start_idle = 20;
+const volatile u32 fd_cpu_end_idle = 30;
+
+const volatile u32 IDLE_PCT_THRESHOLD = 85;
+
+static volatile u32 cached_idle_pct = 0;
+static volatile u64 counter = 0;
+/* Add this map to store system idle percentage */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(key_size, sizeof(u32));
+    __uint(value_size, sizeof(u32));
+    __uint(max_entries, 1);
+} system_idle_pct SEC(".maps");
+
+/* Helper to get idle percentage from the map */
+static u32 get_system_idle_percentage(void)
+{
+	counter++;
+	if (counter % 100000 == 0) {
+		u32 key = 0;
+		u32 *pct = bpf_map_lookup_elem(&system_idle_pct, &key);
+		if (pct) cached_idle_pct = *pct;
+		bpf_printk("getting idle percentage, counter: %llu, cached_idle_pct: %d", counter, cached_idle_pct);
+	}
+	return cached_idle_pct;
+}
+
 static void stat_inc(u32 idx)
 {
 	u64 *cnt_p = bpf_map_lookup_elem(&stats, &idx);
@@ -113,19 +147,29 @@ s32 BPF_STRUCT_OPS(firedancer_select_cpu, struct task_struct *p, s32 prev_cpu, u
 	bool direct = false;
 	cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &direct);
 
-	if (direct) {
-		if (is_firedancer_task(p)) {
-			stat_inc(2);
-			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
-		} else {
-			stat_inc(3);
-			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+	/* Constrain firedancer tasks to CPUs [fd_cpu_start, fd_cpu_end] */
+	if (is_firedancer_task(p)) {
+		u32 idle_pct = get_system_idle_percentage();
+		u32 cpu_start = fd_cpu_start;
+		u32 cpu_end = fd_cpu_end;
+		if (idle_pct >= IDLE_PCT_THRESHOLD) {
+			cpu_start = fd_cpu_start_idle;
+			cpu_end = fd_cpu_end_idle;
+		}
+		if (cpu < cpu_start || cpu >= cpu_end) {
+			if (prev_cpu >= cpu_start && prev_cpu < cpu_end)
+				cpu = prev_cpu;
+			else
+				cpu = cpu_start;
 		}
 	}
-
 	return cpu;
 }
 
+static bool keep_in_kernel(const struct task_struct *p)
+{
+	return p->nr_cpus_allowed < num_possible_cpus;
+}
 static void enqueue_task_in_user_space(struct task_struct *p, u64 enq_flags)
 {
 	struct scx_fd_enqueued_task task = {};
@@ -142,20 +186,10 @@ static void enqueue_task_in_user_space(struct task_struct *p, u64 enq_flags)
 void BPF_STRUCT_OPS(firedancer_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	if (is_firedancer_task(p)) {
-		s32 pid = p->pid;
-		u8 *idle_status = bpf_map_lookup_elem(&fd_idle_status, &pid);
-
-		/*
-		* If task is idle, don't shortcut - let userspace scheduler handle it.
-		*/
-		if (idle_status && *idle_status == 1) {
-			enqueue_task_in_user_space(p, enq_flags);
-			stat_inc(0);  /* count firedancer tasks */
-		} else {
-			/* Task is active or not tracked, proceed with direct dispatch */
-			stat_inc(4); /* firedancer enqueued in kernel */
-			scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, 0);
-		}
+		scx_bpf_dsq_insert(p, FIREDANCER_DSQ, SCX_SLICE_DFL, 0);
+		stat_inc(4);
+	} else if (keep_in_kernel(p)) {
+		scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, 0);
 	} else {
 		scx_bpf_dsq_insert(p, OTHER_DSQ, SCX_SLICE_DFL, enq_flags);
 		stat_inc(1);  /* count other tasks */
@@ -164,23 +198,21 @@ void BPF_STRUCT_OPS(firedancer_enqueue, struct task_struct *p, u64 enq_flags)
 
 void BPF_STRUCT_OPS(firedancer_dispatch, s32 cpu, struct task_struct *prev)
 {
-	bpf_repeat(MAX_ENQUEUED_TASKS) {
-		s32 pid;
-		struct task_struct *p;
-		if (bpf_map_pop_elem(&dispatched, &pid))
-			break;
-		p = bpf_task_from_pid(pid);
-		if (!p) /* task exited by time we got around to dispatching it which is normal */
-			continue;
-		scx_bpf_dsq_insert(p, FIREDANCER_DSQ, SCX_SLICE_DFL, 0);
-		bpf_task_release(p);
+
+	u32 idle_pct = get_system_idle_percentage();
+	bpf_printk("idle_pct: %d", idle_pct);
+	int cpu_start = fd_cpu_start;
+	int cpu_end = fd_cpu_end;
+	if (idle_pct >= IDLE_PCT_THRESHOLD) {
+		cpu_start = fd_cpu_start_idle;
+		cpu_end = fd_cpu_end_idle;
 	}
 
-	if (scx_bpf_dsq_move_to_local(FIREDANCER_DSQ))
-		return;
+	if (cpu < cpu_end && cpu >= cpu_start) {
+		if (scx_bpf_dsq_move_to_local(FIREDANCER_DSQ)) return;
+	}
+	if (scx_bpf_dsq_move_to_local(OTHER_DSQ)) return;
 
-	if (scx_bpf_dsq_move_to_local(OTHER_DSQ))
-		return;
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(firedancer_init)
