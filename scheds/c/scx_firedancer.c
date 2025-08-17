@@ -28,6 +28,7 @@ static bool verbose;
 static volatile int exit_req;
 static int enqueued_fd, dispatched_fd;
 static int fd_idle_status_fd;
+static int leader_fd, pid_to_cpu_fd, reserved_cpus_fd;
 
 static struct scx_firedancer *skel;
 
@@ -112,12 +113,14 @@ static struct CircularQueue cq;
 struct fd_scheduler_shm {
     int scheduler_pid;
     int test_counter;
+	int is_leader;
     char message[256];
     struct {
         int pid;
 		int registered;
         int idle;
 		long deadline_ts;
+		int cpu_id;
         char name[64];
     } tiles[50];
 };
@@ -161,6 +164,17 @@ static void sigint_handler(int simple)
 	exit_req = 1;
 }
 
+static const char *get_name_for_pid(int pid) {
+	if (!g_shm) {
+		return "unknown";
+	}
+	for (int i = 0; i < 50; i++) {
+		if (g_shm->tiles[i].registered && g_shm->tiles[i].pid == pid) {
+			return g_shm->tiles[i].name;
+		}
+	}
+	return "unknown";
+}
 
 static void print_queue_state() {
 	printf("================ QUEUE STATE ==============\n");
@@ -170,7 +184,7 @@ static void print_queue_state() {
 	for (int i = 0; i < cq.size; i++) {
 		int pid = cq.arr[cur].pid;
 		long deadline_ts = get_deadline_ts_for_pid(pid);
-		printf("pid: %d, deadline_ts: %ld, until deadline: %ld \n", pid, deadline_ts, deadline_ts - time_right_now);
+		printf("pid: %d, deadline_ts: %ld, until deadline: %ld, name: %s \n", pid, deadline_ts, deadline_ts - time_right_now, get_name_for_pid(pid));
 		cur = (cur + 1) % MAX_ENQUEUED_TASKS;
 	}
 }
@@ -179,10 +193,10 @@ static void read_stats(struct scx_firedancer *skel, __u64 *stats)
 {
 	int nr_cpus = libbpf_num_possible_cpus();
 	assert(nr_cpus > 0);
-	__u64 cnts[5][nr_cpus];
+	__u64 cnts[6][nr_cpus];
 	__u32 idx;
 
-	memset(stats, 0, sizeof(stats[0]) * 5);
+	memset(stats, 0, sizeof(stats[0]) * 6);
 
 	for (idx = 0; idx < 5; idx++) {
 		int ret, cpu;
@@ -200,27 +214,30 @@ static void *run_stats_printer(void *arg)
 {
     while (!exit_req) {
         if (skel && !UEI_EXITED(skel, uei)) {
-            __u64 stats[5];
+            __u64 stats[6];
             read_stats(skel, stats);
 
             printf("=== Firedancer Scheduler Stats 1.2 ===\n");
             printf("Firedancer tasks enqueued in US: %llu\n", stats[0]);
 			printf("Firedancer enqueued in Kernel: %llu\n", stats[4]);
+			printf("Firedancer enqueued in Kernel (needed for replay): %llu\n", stats[5]);
 			printf("Firedancer tasks dispatched in select_cpu: %llu\n", stats[2]);
             printf("Other tasks enqueued in kernel: %llu\n", stats[1]);
 			printf("Other tasks dispatched in select_cpu: %llu\n", stats[3]);
 			printf("queue size: %d\n", cq.size);
+			printf("is leader: %d\n", g_shm->is_leader);
 
 			long time_right_now = get_time_ns();
             if (g_shm) {
                 printf("\n=== Registered Tiles ===\n");
                 for (int i = 0; i < 50; i++) {
                     if (g_shm->tiles[i].registered) {
-                        printf("[%2d] %-16s pid=%-6d %s deadline in %ld us\n",
+                        printf("[%2d] %-16s pid=%-6d %s deadline in %ld us cpu=%d\n",
                                i, g_shm->tiles[i].name,
                                g_shm->tiles[i].pid,
                                g_shm->tiles[i].idle ? "IDLE" : "ACTIVE",
-							   g_shm->tiles[i].idle ? (g_shm->tiles[i].deadline_ts - time_right_now) / 1000 : 0);
+						   g_shm->tiles[i].idle ? (g_shm->tiles[i].deadline_ts - time_right_now) / 1000 : 0,
+						   g_shm->tiles[i].cpu_id);
                     }
                 }
             }
@@ -241,7 +258,8 @@ static int spawn_stats_thread(void)
 
 int user_space_schedule(struct scx_fd_enqueued_task *task)
 {
-	task->deadline_ts = get_deadline_ts_for_pid(task->pid);
+	// task->deadline_ts = get_deadline_ts_for_pid(task->pid);
+	task->deadline_ts = get_time_ns() + 10000000000; // 10 second
 	enqueue(&cq, task);
 	return 0;
 }
@@ -266,11 +284,25 @@ static void drain_enqueued_map(void)
 
 static void dispatch_batch(void)
 {
+	/* If leader, immediately dispatch all held tasks */
+	if (g_shm && g_shm->is_leader) {
+		int held = cq.size;
+		for (int i = 0; i < held; i++) {
+			struct scx_fd_enqueued_task* task = dequeue(&cq);
+			if (!task) continue;
+			int err = bpf_map_update_elem(dispatched_fd, NULL, &task->pid, 0);
+			if (err) {
+				printf("failed to update dispatch map %d\n", task->pid);
+			}
+		}
+		return;
+	}
+
+	/* Not leader: hold tasks; optional time-based dispatch if desired */
 	ulong time = get_time_ns();
 	for (int i = 0; i < cq.size; i++) {
 		struct scx_fd_enqueued_task* task = dequeue(&cq);
 		if (!task) continue;
-
 		if ((long) time >= task->deadline_ts) {
 			int err = bpf_map_update_elem(dispatched_fd, NULL, &task->pid, 0);
 			if (err) {
@@ -284,6 +316,84 @@ static void dispatch_batch(void)
 	return;
 }
 
+static int tile_is_exempt(const char *name) {
+    if (!name) return 0;
+    // Prefix matches (adjust to your exact naming)
+    // if (!strncmp(name, "net", 3))    return 1;
+    // if (!strncmp(name, "shred", 5))  return 1;
+	// if (!strncmp(name, "sign", 4))  return 1;
+    // if (!strncmp(name, "poh", 3))    return 1;
+    // if (!strncmp(name, "gui", 3))    return 1;
+    // if (!strncmp(name, "metric", 6)) return 1;
+    // if (!strncmp(name, "netlnk", 6)) return 1;
+    // if (!strncmp(name, "cswtch", 6)) return 1;
+    // if (!strncmp(name, "store", 5)) return 1;
+	// if (!strncmp(name, "plugin", 6)) return 1;
+	// // if (!strncmp(name, "pack", 6)) return 1;
+	// // if (!strncmp(name, "bank", 4))  return 1;
+	// if (!strncmp(name, "verify", 6))  return 1;
+	// if (!strncmp(name, "quic", 6))  return 1;
+	// if (!strncmp(name, "resolv", 6))  return 1;
+	// if (!strncmp(name, "dedup", 5))  return 1;
+    return 0;
+}
+
+static int tile_not_needed(const char *name) {
+	if (!name) return 0;
+	if (!strncmp(name, "verify", 3))    return 1;
+	if (!strncmp(name, "pack", 6)) return 1;
+	if (!strncmp(name, "bank", 4))  return 1;
+
+	// if (!strncmp(name, "quic", 4))  return 1;
+	return 0;
+}
+
+static void update_leader_map_from_shm(void)
+{
+	if (leader_fd <= 0 || !g_shm) return;
+	u32 key = 0;
+	u32 val = g_shm->is_leader ? 1 : 0;
+	bpf_map_update_elem(leader_fd, &key, &val, BPF_ANY);
+}
+
+static void update_affinity_maps_from_shm(void)
+{
+	if (!g_shm) return;
+	/* Update leader state first */
+	update_leader_map_from_shm();
+
+	/* Update pid->cpu and reserved cpus */
+	if (pid_to_cpu_fd <= 0 || reserved_cpus_fd <= 0) return;
+
+	int cpus = libbpf_num_possible_cpus();
+	if (cpus > 512) cpus = 512;
+
+	/* Clear reserved when not leader */
+	if (!g_shm->is_leader) {
+		for (u32 c = 0; c < (u32)cpus; c++) {
+			u8 zero = 0;
+			bpf_map_update_elem(reserved_cpus_fd, &c, &zero, BPF_ANY);
+		}
+	}
+
+	/* Track which CPUs are reserved when leader, TODO: can just be done at the start */
+	u8 reserved[512] = {0};
+	for (int i = 0; i < 50; i++) {
+		if (g_shm->tiles[i].registered) {
+			s32 pid = g_shm->tiles[i].pid;
+			s32 cpu = g_shm->tiles[i].cpu_id;
+			if (cpu >= 0 && cpu < cpus) reserved[cpu] = 1;
+			if (pid) bpf_map_update_elem(pid_to_cpu_fd, &pid, &cpu, BPF_ANY);
+		}
+	}
+	if (g_shm->is_leader) {
+		for (u32 c = 0; c < (u32)cpus; c++) {
+			u8 v = reserved[c];
+			bpf_map_update_elem(reserved_cpus_fd, &c, &v, BPF_ANY);
+		}
+	}
+}
+
 static void update_idle_status_from_shm(void)
 {
 	if (!g_shm || fd_idle_status_fd <= 0)
@@ -293,7 +403,11 @@ static void update_idle_status_from_shm(void)
 	for (int i = 0; i < 50; i++) {
 		if (g_shm->tiles[i].registered) {
 			s32 pid = g_shm->tiles[i].pid;
-			u8 idle_status = g_shm->tiles[i].idle ? 1 : 0;
+			// u8 idle_status = g_shm->tiles[i].idle ? 1 : 0;
+			// u8 idle_status = (!g_shm->is_leader && !tile_is_exempt(g_shm->tiles[i].name)) ? 1
+            //                    : (g_shm->tiles[i].idle ? 1 : 0);
+			// u8 idle_status = (!g_shm->is_leader && !tile_is_exempt(g_shm->tiles[i].name));
+			u8 idle_status = (!g_shm->is_leader && tile_not_needed(g_shm->tiles[i].name));
 
 			/* Check if we need to update - either new entry or status changed */
 			if (!idle_cache[i].valid ||
@@ -317,6 +431,9 @@ static void update_idle_status_from_shm(void)
 			idle_cache[i].valid = 0;
 		}
 	}
+
+	/* Maintain leader/pid->cpu/reserved cpu maps */
+	update_affinity_maps_from_shm();
 }
 
 static void sched_main_loop(void)
@@ -335,10 +452,10 @@ static void sched_main_loop(void)
         dispatch_batch();
 
         /* Update idle status frequently - every 1000 iterations */
-        if (++idle_update_counter >= 1000) {
-            idle_update_counter = 0;
-            update_idle_status_from_shm();
-        }
+        // if (++idle_update_counter >= 1000) {
+            // idle_update_counter = 0;
+		update_idle_status_from_shm();
+        // }
     }
 }
 
@@ -361,6 +478,7 @@ static int setup_shm(void) {
             // Initialize the shared memory
             memset(g_shm, 0, sizeof(*g_shm));
             g_shm->scheduler_pid = getpid();
+			g_shm->is_leader = 1; // TODO: change to 0 to improve initial performance
             strcpy(g_shm->message, "Scheduler started");
 
             printf("Scheduler PID: %d\n", g_shm->scheduler_pid);
@@ -422,9 +540,15 @@ restart:
 	enqueued_fd = bpf_map__fd(skel->maps.enqueued);
 	dispatched_fd = bpf_map__fd(skel->maps.dispatched);
 	fd_idle_status_fd = bpf_map__fd(skel->maps.fd_idle_status);
+	leader_fd = bpf_map__fd(skel->maps.leader_state);
+	pid_to_cpu_fd = bpf_map__fd(skel->maps.pid_to_cpu);
+	reserved_cpus_fd = bpf_map__fd(skel->maps.reserved_cpus);
 	assert(enqueued_fd > 0);
 	assert(dispatched_fd > 0);
 	assert(fd_idle_status_fd > 0);
+	assert(leader_fd > 0);
+	assert(pid_to_cpu_fd > 0);
+	assert(reserved_cpus_fd > 0);
 
 	SCX_BUG_ON(spawn_stats_thread(), "Failed to spawn stats thread");
 
