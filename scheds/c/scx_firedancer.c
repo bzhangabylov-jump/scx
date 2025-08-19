@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 
+#define _GNU_SOURCE
+
 #include <unistd.h>
 #include <signal.h>
 #include <assert.h>
@@ -436,6 +438,34 @@ static void update_idle_status_from_shm(void)
 	update_affinity_maps_from_shm();
 }
 
+static int relaxed_affinity[50];
+
+static void relax_affinity_for_new_tiles(void) {
+	if (!g_shm) return;
+    int cpus = libbpf_num_possible_cpus();
+    if (cpus <= 0) return;
+
+    cpu_set_t all;
+    CPU_ZERO(&all);
+    for (int c = 0; c < cpus && c < (int)CPU_SETSIZE; c++) CPU_SET(c, &all);
+
+    for (int i = 0; i < 50; i++) {
+        if (!g_shm->tiles[i].registered) continue;
+        if (relaxed_affinity[i]) continue;
+
+        s32 pid = g_shm->tiles[i].pid;
+        s32 cpu = g_shm->tiles[i].cpu_id;
+
+        if (pid_to_cpu_fd > 0)
+            bpf_map_update_elem(pid_to_cpu_fd, &pid, &cpu, BPF_ANY);
+
+        /* Allow anywhere while not leader */
+        sched_setaffinity(pid, sizeof(all), &all);
+
+        relaxed_affinity[i] = 1;
+    }
+}
+
 static void sched_main_loop(void)
 {
 	u64 last_loop = 0;
@@ -451,6 +481,7 @@ static void sched_main_loop(void)
         drain_enqueued_map();
         dispatch_batch();
 
+		relax_affinity_for_new_tiles();
         /* Update idle status frequently - every 1000 iterations */
         // if (++idle_update_counter >= 1000) {
             // idle_update_counter = 0;
@@ -478,7 +509,7 @@ static int setup_shm(void) {
             // Initialize the shared memory
             memset(g_shm, 0, sizeof(*g_shm));
             g_shm->scheduler_pid = getpid();
-			g_shm->is_leader = 1; // TODO: change to 0 to improve initial performance
+			g_shm->is_leader = 0;
             strcpy(g_shm->message, "Scheduler started");
 
             printf("Scheduler PID: %d\n", g_shm->scheduler_pid);

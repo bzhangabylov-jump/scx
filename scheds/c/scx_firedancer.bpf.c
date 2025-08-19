@@ -157,6 +157,7 @@ static bool needed_for_replay(struct task_struct *p)
 	/* Minimal set for replay-critical tiles */
 	if (bpf_strncmp(p->comm, 4, "net:") == 0)  return true;
 	if (bpf_strncmp(p->comm, 5, "quic:") == 0) return true;
+	if (is_firedancer_task(p)) return true;
 	// TODO: add the rest of the replay-critical tiles
 	return false;
 }
@@ -188,6 +189,7 @@ void BPF_STRUCT_OPS(firedancer_enqueue, struct task_struct *p, u64 enq_flags)
 	bool leader = is_leader_now();
 	if (is_firedancer_task(p)) {
 		if (leader) {
+			bpf_printk("leader, enqueuing FD task: %s to cpu: %d", p->comm, get_pid_cpu(p->pid));
 			/* Pin to ideal CPU if known */
 			s32 target_cpu = get_pid_cpu(p->pid);
 			if (target_cpu >= 0)
@@ -199,6 +201,7 @@ void BPF_STRUCT_OPS(firedancer_enqueue, struct task_struct *p, u64 enq_flags)
 		}
 		/* Not leader */
 		if (needed_for_replay(p)) {
+			bpf_printk("needed_for_replay: %s", p->comm);
 			/* Allow across all cores similar to Agave */
 			scx_bpf_dsq_insert(p, OTHER_DSQ, SCX_SLICE_DFL, 0);
 			stat_inc(5);
@@ -247,7 +250,9 @@ void BPF_STRUCT_OPS(firedancer_dispatch, s32 cpu, struct task_struct *prev)
 
 	/* For OTHER tasks, restrict to non-reserved CPUs when leader -> TODO: commented out so kworkers don't time out */
 	// if (!leader || !cpu_is_reserved(cpu)) {
-		(void)scx_bpf_dsq_move_to_local(OTHER_DSQ);
+	if (scx_bpf_dsq_move_to_local(OTHER_DSQ) ) {
+		return;
+	}
 	// }
 }
 
