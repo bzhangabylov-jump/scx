@@ -14,12 +14,12 @@ char _license[] SEC("license") = "GPL";
 #define FIREDANCER_DSQ         0        /* Custom DSQ for Firedancer tasks */
 #define OTHER_DSQ              1        /* Custom DSQ for other tasks */
 
-/* Statistics tracking */
+/* Statistics tracking, can be used to debug with stat_inc(idx) */
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(key_size, sizeof(u32));
 	__uint(value_size, sizeof(u64));
-	__uint(max_entries, 6);  /* [firedancer enqueued in US, other, select_cpu_firedancer, select_cpu_other, firedancer enqueued in kernel, firedancer enqueued in kernel (needed for replay)] */
+	__uint(max_entries, 6);
 } stats SEC(".maps");
 
 struct {
@@ -101,13 +101,6 @@ static __always_inline bool is_leader_now(void)
 	return v && (*v != 0);
 }
 
-static __always_inline bool cpu_is_reserved(s32 cpu)
-{
-	u32 idx = (u32)cpu;
-	u8 *v = bpf_map_lookup_elem(&reserved_cpus, &idx);
-	return v && (*v != 0);
-}
-
 static __always_inline s32 get_pid_cpu(s32 pid)
 {
 	s32 *v = bpf_map_lookup_elem(&pid_to_cpu, &pid);
@@ -141,6 +134,11 @@ static void enqueue_task_in_user_space(struct task_struct *p, u64 enq_flags)
 
 void BPF_STRUCT_OPS(firedancer_enqueue, struct task_struct *p, u64 enq_flags)
 {
+	if (p->flags & PF_KTHREAD) {
+		scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, 0);
+		return;
+	}
+
 	bool leader = is_leader_now();
 	if (is_firedancer_task(p)) {
 		if (leader) {
@@ -150,28 +148,20 @@ void BPF_STRUCT_OPS(firedancer_enqueue, struct task_struct *p, u64 enq_flags)
 				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | (u64)target_cpu, SCX_SLICE_DFL, 0);
 			else
 				scx_bpf_dsq_insert(p, FIREDANCER_DSQ, SCX_SLICE_DFL, 0);
-			stat_inc(4);
 			return;
 		}
 		/* Not leader */
 		if (needed_for_replay(p)) {
 			/* Allow across all cores similar to Agave */
 			scx_bpf_dsq_insert(p, OTHER_DSQ, SCX_SLICE_DFL, 0);
-			stat_inc(5);
 			return;
 		}
 		/* Hold in userspace */
 		enqueue_task_in_user_space(p, enq_flags);
-		stat_inc(0);
 		return;
 	} else {
-		if (p->flags & PF_KTHREAD) {
-			scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, 0);
-			return;
-		}
 		/* Agave or other tasks */
 		scx_bpf_dsq_insert(p, OTHER_DSQ, SCX_SLICE_DFL, enq_flags);
-		stat_inc(1);
 		return;
 	}
 }

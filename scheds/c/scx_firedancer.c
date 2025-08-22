@@ -15,6 +15,8 @@
 #include <sys/stat.h>
 #include <pthread.h>
 #include <sched.h>
+#include <errno.h>
+#include <time.h>
 #include "scx_firedancer.h"
 
 const char help_fmt[] =
@@ -34,6 +36,7 @@ static int leader_fd, pid_to_cpu_fd;
 
 static struct scx_firedancer *skel;
 
+/* Just a data structure to hold the enqueued tasks, just a circular queue for the POC */
 struct CircularQueue {
 	struct scx_fd_enqueued_task arr[MAX_ENQUEUED_TASKS];
 	int front;
@@ -70,6 +73,7 @@ struct scx_fd_enqueued_task* dequeue(struct CircularQueue* q) {
 
 static struct CircularQueue cq;
 
+/* POC shared memory for the scheduler to communicate with the tiles -> Tiles write to this */
 struct fd_scheduler_shm {
     int scheduler_pid;
     int test_counter;
@@ -112,18 +116,6 @@ static void sigint_handler(int simple)
 	exit_req = 1;
 }
 
-static const char *get_name_for_pid(int pid) {
-	if (!g_shm) {
-		return "unknown";
-	}
-	for (int i = 0; i < 50; i++) {
-		if (g_shm->tiles[i].registered && g_shm->tiles[i].pid == pid) {
-			return g_shm->tiles[i].name;
-		}
-	}
-	return "unknown";
-}
-
 static void read_stats(struct scx_firedancer *skel, __u64 *stats)
 {
 	int nr_cpus = libbpf_num_possible_cpus();
@@ -133,7 +125,7 @@ static void read_stats(struct scx_firedancer *skel, __u64 *stats)
 
 	memset(stats, 0, sizeof(stats[0]) * 6);
 
-	for (idx = 0; idx < 5; idx++) {
+	for (idx = 0; idx < 6; idx++) {
 		int ret, cpu;
 
 		ret = bpf_map_lookup_elem(bpf_map__fd(skel->maps.stats),
@@ -155,7 +147,7 @@ static void *run_stats_printer(void *arg)
 			printf("\n\n\n");
             printf("=== Firedancer Scheduler Stats ===\n");
 			printf("queue size: %d\n", cq.size);
-			printf("is_leader: %d\n", g_shm->is_leader);
+			printf("is_leader: %d\n", g_shm ? g_shm->is_leader : 0);
 
             if (g_shm) {
                 printf("\n=== Registered Tiles ===\n");
@@ -164,7 +156,7 @@ static void *run_stats_printer(void *arg)
                         printf("[%2d] %-16s pid=%-6d cpu=%d\n",
                                i, g_shm->tiles[i].name,
                                g_shm->tiles[i].pid,
-							   g_shm->tiles[i].cpu_id);
+						   g_shm->tiles[i].cpu_id);
                     }
                 }
             }
@@ -223,8 +215,9 @@ static void dispatch_batch(void)
 	}
 
 	/* Not leader: hold tasks */
-	ulong time = get_time_ns();
-	for (int i = 0; i < cq.size; i++) {
+	uint64_t time = get_time_ns();
+	int held = cq.size;
+	for (int i = 0; i < held; i++) {
 		struct scx_fd_enqueued_task* task = dequeue(&cq);
 		if (!task) continue;
 		if ((long) time >= task->deadline_ts) {
@@ -249,7 +242,8 @@ static void update_leader_map_from_shm(void)
 
 static int relaxed_affinity[50];
 
-static void relax_affinity_for_new_tiles(void) {
+static void relax_affinity_for_new_tiles(void)
+{
 	if (!g_shm) return;
 	int cpus = libbpf_num_possible_cpus();
 	if (cpus <= 0) return;
@@ -292,7 +286,8 @@ static void sched_main_loop(void)
     }
 }
 
-static int setup_shm(void) {
+static int setup_shm(void)
+{
 	mode_t old_umask = umask(0);
 	int shm_fd = shm_open("/fd_scheduler_shm", O_CREAT | O_EXCL | O_RDWR, 0666);
 	umask(old_umask);
